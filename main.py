@@ -5,6 +5,7 @@ import numpy as np
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from Evaluate.evaluateMV_Foul import evaluate
 import torch
+from torch.cuda.amp import GradScaler
 from dataset import MultiViewDataset
 from train import trainer, evaluation
 import torch.nn as nn
@@ -15,6 +16,19 @@ from torchvision.models.video import R3D_18_Weights, MC3_18_Weights
 from torchvision.models.video import R2Plus1D_18_Weights, S3D_Weights
 from torchvision.models.video import MViT_V2_S_Weights, MViT_V1_B_Weights
 from torchvision.models.video import mvit_v2_s, MViT_V2_S_Weights, mvit_v1_b, MViT_V1_B_Weights
+
+
+def print_gpu_memory_stats():
+    """Print GPU memory usage statistics"""
+    if torch.cuda.is_available():
+        print("\nGPU Memory Usage:")
+        for i in range(torch.cuda.device_count()):
+            total_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved(i) / 1024**3  # GB
+            allocated = torch.cuda.memory_allocated(i) / 1024**3  # GB
+            free = total_memory - reserved
+            print(f"  GPU {i}: Total {total_memory:.2f} GB | Reserved {reserved:.2f} GB | Allocated {allocated:.2f} GB | Free {free:.2f} GB")
+        print("")
 
 
 def checkArguments():
@@ -60,6 +74,11 @@ def checkArguments():
         print("Possible number for the fps are between 1 and 25")
         exit()
 
+    # Check for memory optimization arguments
+    if hasattr(args, 'use_amp') and args.use_amp and not torch.cuda.is_available():
+        print("Warning: AMP requested but CUDA is not available. Disabling AMP.")
+        args.use_amp = False
+
 
 def main(*args):
 
@@ -88,9 +107,33 @@ def main(*args):
         only_evaluation = args.only_evaluation
         path_to_model_weights = args.path_to_model_weights
         initial_epochs = args.initial_epochs
+        
+        # Handle memory optimization options
+        use_amp = args.use_amp if hasattr(args, 'use_amp') else False
+        use_checkpoint = args.use_checkpoint if hasattr(args, 'use_checkpoint') else False
+        
+        # Apply memory_efficient settings if enabled
+        if hasattr(args, 'memory_efficient') and args.memory_efficient:
+            use_amp = True
+            use_checkpoint = True
+            batch_size = min(batch_size, 2)  # Reduce batch size
+            num_views = min(num_views, 2)    # Reduce number of views
+            print("Memory efficient mode enabled:")
+            print(f"  - Using AMP: {use_amp}")
+            print(f"  - Using gradient checkpointing: {use_checkpoint}")
+            print(f"  - Batch size limited to: {batch_size}")
+            print(f"  - Number of views limited to: {num_views}")
+            
+            # Enable deterministic mode for consistent memory usage
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            print("  - Deterministic mode enabled for consistent memory usage")
     else:
         print("EXIT")
         exit()
+
+    # Print memory stats before model creation
+    print_gpu_memory_stats()
 
     # Logging information
     numeric_level = getattr(logging, 'INFO'.upper(), None)
@@ -143,23 +186,23 @@ def main(*args):
         print("We continue with r2plus1d_18")
     
     if only_evaluation == 0:
-        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views = 5, 
+        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views=5, 
         transform_model=transforms_model)
         
         test_loader2 = torch.utils.data.DataLoader(dataset_Test2,
             batch_size=1, shuffle=False,
             num_workers=max_num_worker, pin_memory=True)
     elif only_evaluation == 1:
-        dataset_Chall = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Chall', num_views = 5, 
+        dataset_Chall = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Chall', num_views=5, 
         transform_model=transforms_model)
 
         chall_loader2 = torch.utils.data.DataLoader(dataset_Chall,
             batch_size=1, shuffle=False,
             num_workers=max_num_worker, pin_memory=True)
     elif only_evaluation == 2:
-        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views = 5, 
+        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views=5, 
         transform_model=transforms_model)
-        dataset_Chall = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Chall', num_views = 5, 
+        dataset_Chall = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Chall', num_views=5, 
         transform_model=transforms_model)
 
         test_loader2 = torch.utils.data.DataLoader(dataset_Test2,
@@ -172,10 +215,10 @@ def main(*args):
     else:
         # Create Train Validation and Test datasets
         dataset_Train = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Train',
-            num_views = num_views, transform=transformAug, transform_model=transforms_model)
-        dataset_Valid2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Valid', num_views = 5, 
+            num_views=num_views, transform=transformAug, transform_model=transforms_model)
+        dataset_Valid2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Valid', num_views=5, 
             transform_model=transforms_model)
-        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views = 5, 
+        dataset_Test2 = MultiViewDataset(path=path, start=start_frame, end=end_frame, fps=fps, split='Test', num_views=5, 
             transform_model=transforms_model)
 
         # Create the dataloaders for train validation and test datasets
@@ -194,7 +237,15 @@ def main(*args):
     ###################################
     #       LOADING THE MODEL         #
     ###################################
-    model = MVNetwork(net_name=pre_model, agr_type=pooling_type).cuda()
+    model = MVNetwork(
+        net_name=pre_model, 
+        agr_type=pooling_type,
+        use_amp=use_amp,
+        use_checkpoint=use_checkpoint
+    ).cuda()
+    
+    # Print memory stats after model creation
+    print_gpu_memory_stats()
 
     # Load pretrained weights if path provided
     if path_to_model_weights != "":
@@ -222,6 +273,7 @@ def main(*args):
     if only_evaluation == 3:
         # For training mode
         epoch_start = 0
+        phase = "standard"  # Default phase name
         
         if weighted_loss == 'Yes':
             criterion_offence_severity = nn.CrossEntropyLoss(weight=dataset_Train.getWeights()[0].cuda())
@@ -234,6 +286,7 @@ def main(*args):
 
         # Phase 1: Train with frozen MVIT backbone for initial epochs
         if path_to_model_weights != "" and hasattr(model, 'base_network'):
+            phase = "phase1"
             logging.info(f"Phase 1: Training with frozen MVIT backbone for {initial_epochs} epochs")
             
             # Create optimizer for only unfrozen parameters
@@ -257,9 +310,16 @@ def main(*args):
             
             # Run Phase 1 training if not completed yet
             if epoch_start < initial_epochs:
-                trainer(train_loader, val_loader2, test_loader2, model, optimizer, scheduler, criterion, 
-                        best_model_path, epoch_start, model_name=model_name, path_dataset=path, 
-                        max_epochs=initial_epochs, phase="phase1")
+                trainer(
+                    train_loader, val_loader2, test_loader2, 
+                    model, optimizer, scheduler, criterion,
+                    best_model_path, epoch_start, 
+                    model_name=model_name, 
+                    path_dataset=path, 
+                    max_epochs=initial_epochs,
+                    phase=phase,
+                    use_amp=use_amp
+                )
             
             # Save Phase 1 model
             phase1_model_path = os.path.join(best_model_path, "phase1_model.pth.tar")
@@ -271,6 +331,7 @@ def main(*args):
             }, phase1_model_path)
             
             # Phase 2: Unfreeze MVIT and continue training
+            phase = "phase2"
             logging.info("Phase 2: Unfreezing MVIT backbone for fine-tuning")
             
             # Unfreeze MVIT backbone
@@ -299,9 +360,16 @@ def main(*args):
                     epoch_start = load['epoch']
             
             # Run Phase 2 training
-            trainer(train_loader, val_loader2, test_loader2, model, optimizer, scheduler, criterion, 
-                   best_model_path, epoch_start, model_name=model_name, path_dataset=path, 
-                   max_epochs=max_epochs, phase="phase2")
+            trainer(
+                train_loader, val_loader2, test_loader2, 
+                model, optimizer, scheduler, criterion,
+                best_model_path, epoch_start, 
+                model_name=model_name, 
+                path_dataset=path, 
+                max_epochs=max_epochs,
+                phase=phase,
+                use_amp=use_amp
+            )
         else:
             # Standard training without phases (no pretrained weights or no base_network)
             optimizer = torch.optim.AdamW(
@@ -323,8 +391,16 @@ def main(*args):
                     epoch_start = load['epoch']
             
             # Standard training
-            trainer(train_loader, val_loader2, test_loader2, model, optimizer, scheduler, criterion, 
-                   best_model_path, epoch_start, model_name=model_name, path_dataset=path, max_epochs=max_epochs)
+            trainer(
+                train_loader, val_loader2, test_loader2, 
+                model, optimizer, scheduler, criterion,
+                best_model_path, epoch_start, 
+                model_name=model_name, 
+                path_dataset=path, 
+                max_epochs=max_epochs,
+                phase=phase,
+                use_amp=use_amp
+            )
 
     # Start training or evaluation
     if only_evaluation == 0:
@@ -332,6 +408,7 @@ def main(*args):
             test_loader2,
             model,
             set_name="test",
+            use_amp=use_amp
         ) 
         results = evaluate(os.path.join(path, "Test", "annotations.json"), prediction_file)
         print("TEST")
@@ -342,6 +419,7 @@ def main(*args):
             chall_loader2,
             model,
             set_name="chall",
+            use_amp=use_amp
         )
 
         results = evaluate(os.path.join(path, "Chall", "annotations.json"), prediction_file)
@@ -353,6 +431,7 @@ def main(*args):
             test_loader2,
             model,
             set_name="test",
+            use_amp=use_amp
         )
 
         results = evaluate(os.path.join(path, "Test", "annotations.json"), prediction_file)
@@ -363,6 +442,7 @@ def main(*args):
             chall_loader2,
             model,
             set_name="chall",
+            use_amp=use_amp
         )
 
         results = evaluate(os.path.join(path, "Chall", "annotations.json"), prediction_file)
@@ -399,6 +479,10 @@ if __name__ == '__main__':
     parser.add_argument("--weight_decay", required=False, type=float, default=0.001, help="Weight decacy")
     parser.add_argument("--use_hrnet", required=False, action='store_true', help="Use HRNet as secondary feature extractor")
     
+    # Memory optimization arguments
+    parser.add_argument("--use_amp", action='store_true', help="Use Automatic Mixed Precision")
+    parser.add_argument("--use_checkpoint", action='store_true', help="Use gradient checkpointing")
+    parser.add_argument("--memory_efficient", action='store_true', help="Enable all memory optimizations")
 
     parser.add_argument("--only_evaluation", required=False, type=int, default=3, help="Only evaluation, 0 = on test set, 1 = on chall set, 2 = on both sets and 3 = train/valid/test")
     parser.add_argument("--path_to_model_weights", required=False, type=str, default="", help="Path to the model weights")

@@ -249,23 +249,24 @@ class MVNetwork(torch.nn.Module):
         # Store the base network for feature extraction
         self.base_network = network
 
-    # Modified preprocess method to handle tensor shape issues
     def preprocess_for_mvit(self, mvimages):
         """Safer preprocessing for MVITv2"""
         B, V, C, T, H, W = mvimages.shape
         
-        # Subsample frames if needed - MVITv2 typically works with 16 frames
-        if T > 16:
-            # Create indices for frame sampling
-            step = T / 16
-            indices = [min(int(i * step), T-1) for i in range(16)]
-            indices = torch.tensor(indices, device=mvimages.device)
-            # Sample frames
+        # Ensure consistent frame count (MVITv2 typically expects 16 frames)
+        target_frames = 16
+        if T > target_frames:
+            # Sample frames evenly
+            indices = torch.linspace(0, T-1, target_frames).long()
             mvimages = mvimages[:, :, :, indices]
-            T = 16  # Update T after subsampling
+        elif T < target_frames:
+            # Pad with repeats of the last frame
+            padding = torch.zeros(B, V, C, target_frames-T, H, W, device=mvimages.device)
+            last_frame = mvimages[:, :, :, -1:].repeat(1, 1, 1, target_frames-T, 1, 1)
+            mvimages = torch.cat([mvimages, last_frame], dim=3)
         
         # Reshape to batch all views together
-        mv_flat = mvimages.reshape(B * V, C, T, H, W)
+        mv_flat = mvimages.reshape(B * V, C, mvimages.shape[3], H, W)
         
         return mv_flat
     

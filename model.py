@@ -183,12 +183,23 @@ class MVNetwork(torch.nn.Module):
                 
         network.fc = torch.nn.Sequential()  # Remove classification head
         
-        # Apply gradient checkpointing to the backbone model
+        # Fix the gradient checkpointing for MVITv2 blocks
         if self.use_checkpoint and net_name == "mvit_v2_s":
-            # Enable gradient checkpointing for MViT blocks
+            # Use a different approach to checkpoint MVITv2 blocks
             for i, block in enumerate(network.blocks):
-                network.blocks[i]._forward = block.forward
-                network.blocks[i].forward = lambda x, thw, block=block: checkpoint.checkpoint(block._forward, x, thw)
+                # Store original forward method
+                original_forward = block.forward
+                
+                # Create a safe wrapper for checkpointing
+                def make_checkpoint_function(original_fn):
+                    def checkpoint_fn(x, thw):
+                        def _inner_fn(x_inner, thw_inner):
+                            return original_fn(x_inner, thw_inner)
+                        return checkpoint.checkpoint(_inner_fn, x, thw)
+                    return checkpoint_fn
+                
+                # Replace the forward method
+                network.blocks[i].forward = make_checkpoint_function(original_forward)
         
         # Secondary feature extractor (HRNet)
         self.hrnet = HRNetFeatureExtractor(model_name='hrnet_w32', pretrained=True)
@@ -249,51 +260,68 @@ class MVNetwork(torch.nn.Module):
         # Store the base network for feature extraction
         self.base_network = network
 
+    # Fix the preprocessing function to ensure consistent tensor dimensions
     def preprocess_for_mvit(self, mvimages):
-        """Safer preprocessing for MVITv2"""
         B, V, C, T, H, W = mvimages.shape
         
-        # Ensure consistent frame count (MVITv2 typically expects 16 frames)
+        # Use a specific target frame count that's compatible with MVITv2
         target_frames = 16
-        if T > target_frames:
-            # Sample frames evenly
-            indices = torch.linspace(0, T-1, target_frames).long()
-            mvimages = mvimages[:, :, :, indices]
-        elif T < target_frames:
-            # Pad with repeats of the last frame
-            padding = torch.zeros(B, V, C, target_frames-T, H, W, device=mvimages.device)
-            last_frame = mvimages[:, :, :, -1:].repeat(1, 1, 1, target_frames-T, 1, 1)
-            mvimages = torch.cat([mvimages, last_frame], dim=3)
         
-        # Reshape to batch all views together
-        mv_flat = mvimages.reshape(B * V, C, mvimages.shape[3], H, W)
+        # Create a new tensor with the exact expected shape
+        processed_frames = torch.zeros(B * V, C, target_frames, H, W, device=mvimages.device)
         
-        return mv_flat
+        # Fill with actual frame data (as many frames as available)
+        actual_frames = min(T, target_frames)
+        
+        # For each batch and view
+        for b in range(B):
+            for v in range(V):
+                # Copy the available frames
+                if T <= target_frames:
+                    processed_frames[b*V + v, :, :T] = mvimages[b, v, :, :T]
+                    # If we need padding, repeat the last frame
+                    if T < target_frames:
+                        processed_frames[b*V + v, :, T:] = mvimages[b, v, :, -1].unsqueeze(0).repeat(target_frames-T, 1, 1)
+                else:
+                    # Sample frames evenly if we have more than we need
+                    indices = torch.linspace(0, T-1, target_frames).long()
+                    processed_frames[b*V + v] = mvimages[b, v, :, indices]
+        
+        return processed_frames
     
     def forward(self, mvimages):
-        B, V, C, T, H, W = mvimages.shape  # Batch, Views, Channel, Depth, Height, Width
+        B, V, C, T, H, W = mvimages.shape
         
-        # Use mixed precision if enabled
+        # Process in smaller batches to reduce memory demands
         with torch.cuda.amp.autocast() if self.use_amp else torch.no_grad():
-            if self.agr_type == "perceiver":
-                # Preprocess input for MVITv2
-                mv_flat = self.preprocess_for_mvit(mvimages)
-                
-                # Extract features using gradient checkpointing if enabled
-                if self.use_checkpoint:
-                    mvit_features = checkpoint.checkpoint(self.base_network, mv_flat)
-                else:
-                    mvit_features = self.base_network(mv_flat)
-                
-                # Reshape back to batch and view dimensions
-                mvit_features = mvit_features.view(B, V, -1)  # (B, V, mvit_feat_dim)
-                
-                # Process with HRNet one view at a time to save memory
-                hrnet_features = []
-                for v in range(V):
-                    # Process one view at a time
-                    view_features = self.hrnet(mvimages[:, v])  # (B, hrnet_feat_dim)
-                    hrnet_features.append(view_features.unsqueeze(1))  # (B, 1, hrnet_feat_dim)
+            # First, preprocess MVITv2 input
+            mv_flat = self.preprocess_for_mvit(mvimages)
+            
+            # Process MVITv2 features in smaller chunks if needed
+            chunk_size = 2  # Process 2 views at a time to save memory
+            mvit_features_list = []
+            
+            for i in range(0, B*V, chunk_size):
+                chunk = mv_flat[i:min(i+chunk_size, B*V)]
+                with torch.cuda.amp.autocast() if self.use_amp else torch.no_grad():
+                    if self.use_checkpoint:
+                        chunk_features = checkpoint.checkpoint(self.base_network, chunk)
+                    else:
+                        chunk_features = self.base_network(chunk)
+                    mvit_features_list.append(chunk_features)
+            
+            # Concatenate and reshape
+            mvit_features = torch.cat(mvit_features_list, dim=0)
+            mvit_features = mvit_features.view(B, V, -1)
+            
+            # Process HRNet features (one view at a time)
+            hrnet_features = []
+            for v in range(V):
+                # Process middle frame only to save memory
+                mid_frame = mvimages[:, v, :, T//2]
+                view_features = self.hrnet(mid_frame)
+                hrnet_features.append(view_features.unsqueeze(1))
+
                 
                 # Concatenate along view dimension
                 hrnet_features = torch.cat(hrnet_features, dim=1)  # (B, V, hrnet_feat_dim)
